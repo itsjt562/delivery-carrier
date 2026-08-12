@@ -13,8 +13,6 @@
         "views/delivery_carrier_views.xml",
     ],
     "external_dependencies": {"python": ["requests"]},
-    # Flip to True once models/shippo_request.py and delivery_carrier.py have
-    # real logic. Skeleton only as of 2026-08-11 -- see build plan doc.
-    "installable": False,
+    "installable": True,
     "license": "AGPL-3",
 }
