@@ -7,6 +7,11 @@ from .shippo_request import ShippoRequest
 class DeliveryCarrier(models.Model):
     _inherit = "delivery.carrier"
 
+    # Shippo's label_file_type tokens don't match file extensions 1:1
+    # (ZPLII -> .zpl) -- attachment filenames need the real extension or
+    # the chatter attachment is mislabeled/unopenable as what it claims to be.
+    _SHIPPO_LABEL_EXTENSIONS = {"PDF": "pdf", "PNG": "png", "ZPLII": "zpl"}
+
     delivery_type = fields.Selection(
         selection_add=[("shippo", "Shippo")],
         ondelete={
@@ -86,9 +91,14 @@ class DeliveryCarrier(models.Model):
                     "shippo_carrier_service": bought.carrier_service,
                 }
             )
+            label_ext = self._SHIPPO_LABEL_EXTENSIONS.get(
+                self.shippo_label_file_type, self.shippo_label_file_type.lower()
+            )
             picking.message_post(
                 body=_("Shipment purchased via Shippo. Tracking: %s") % bought.tracking_code,
-                attachments=[(f"Label-{picking.name}.pdf", bought.get_label_content())],
+                attachments=[
+                    (f"Label-{picking.name}.{label_ext}", bought.get_label_content())
+                ],
             )
 
             res.append({"exact_price": price, "tracking_number": bought.tracking_code})
