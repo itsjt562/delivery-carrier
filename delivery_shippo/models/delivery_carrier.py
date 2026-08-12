@@ -27,7 +27,9 @@ class DeliveryCarrier(models.Model):
     shippo_label_file_type = fields.Selection(
         [("PDF", "PDF"), ("PNG", "PNG"), ("ZPLII", "ZPLII")],
         string="Label Format",
-        default="PDF",
+        default="ZPLII",
+        help="ZPLII renders at 812x1219 dots @ 203dpi -- the standard 4x6in "
+        "thermal shipping label size, confirmed against a real sandbox label.",
     )
 
     # -- rate_shipment ------------------------------------------------------
