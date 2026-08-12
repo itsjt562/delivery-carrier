@@ -129,18 +129,31 @@ class DeliveryCarrier(models.Model):
             address["state"] = addr_obj.state_id.code
         return address
 
-    def _shippo_prepare_parcel(self, weight_kg: float) -> dict:
-        # TODO: pull real parcel dims from a stock.package.type once one is
-        # defined for Helm's shipping boxes/label mailers, same pattern as
-        # delivery_easypost_oca's _prepare_parcel + stock_package_type.py.
-        # Hardcoded placeholder dims below -- do not ship live on these.
-        weight_lb = weight_kg * 2.20462
+    # Helm ships everything in one packaging format -- confirmed with Joseph
+    # 2026-08-12: 8x12x1in bubble mailer, ~8oz packaging weight (mailer +
+    # insert), flat regardless of order contents. No stock.package.type
+    # variation needed unless that changes.
+    _MAILER_LENGTH_IN = "12"
+    _MAILER_WIDTH_IN = "8"
+    _MAILER_HEIGHT_IN = "1"
+    _MAILER_WEIGHT_LB = 0.5  # 8 oz
+
+    def _shippo_prepare_parcel(self, weight) -> dict:
+        # weight arrives in Odoo's configured weight UoM (kg by default,
+        # lb if product.weight_in_lbs is set) -- convert explicitly rather
+        # than assume, same pattern as delivery_easypost_oca's
+        # _easypost_oca_convert_weight.
+        weight_uom_id = self.env[
+            "product.template"
+        ]._get_weight_uom_id_from_ir_config_parameter()
+        weight_lb = weight_uom_id._compute_quantity(weight, self.env.ref("uom.product_uom_lb"))
+        total_lb = max(weight_lb + self._MAILER_WEIGHT_LB, 0.1)
         return {
-            "length": "6",
-            "width": "4",
-            "height": "2",
+            "length": self._MAILER_LENGTH_IN,
+            "width": self._MAILER_WIDTH_IN,
+            "height": self._MAILER_HEIGHT_IN,
             "distance_unit": "in",
-            "weight": str(round(max(weight_lb, 0.1), 2)),
+            "weight": str(round(total_lb, 2)),
             "mass_unit": "lb",
         }
 
