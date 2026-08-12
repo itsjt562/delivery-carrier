@@ -60,6 +60,16 @@ class TestDeliveryCarrier(ShippoTestBaseCase):
         self.assertIn("TRACK_DEFAULT_123", picking.shippo_tracking_url)
         self.assertEqual(picking.shippo_carrier_name, "USPS")
 
+        # Regression test: attachment filename must match the real label
+        # format, not always ".pdf" regardless of shippo_label_file_type.
+        label_message = picking.message_ids.filtered(lambda m: m.attachment_ids)
+        self.assertTrue(label_message, "No label attachment posted to the chatter")
+        attachment = label_message.attachment_ids[0]
+        self.assertTrue(
+            attachment.name.endswith(f".{self.carrier._SHIPPO_LABEL_EXTENSIONS['PDF']}"),
+            f"Expected a .pdf attachment for label_file_type=PDF, got {attachment.name}",
+        )
+
         # get_tracking_link should surface exactly what was written
         self.assertEqual(
             self.carrier.shippo_get_tracking_link(picking), picking.shippo_tracking_url
