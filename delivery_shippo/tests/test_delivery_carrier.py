@@ -220,3 +220,104 @@ class TestShippoServiceLevel(ShippoTestBaseCase):
         order = self._create_sale_order(qty=1)
         with self.assertRaises(UserError):
             self.carrier.shippo_rate_shipment(order)
+
+
+class TestShippoWeightOverrides(ShippoTestBaseCase):
+    """A weight typed by a human has to reach Shippo.
+
+    Both API paths used to sum product weights inline, so neither of Odoo's two
+    hand-override points reached the parcel. The test product weighs 0.25 in
+    the company weight UoM, so every expectation here is a different number
+    from the catalogue default, which is the only way to tell a honoured
+    override from an ignored one.
+    """
+
+    def _expected_parcel_weight(self, weight_in_company_uom):
+        """What _shippo_prepare_parcel should produce for a given input weight.
+
+        Mirrors the conversion deliberately. What is under test is which weight
+        gets selected, not whether kg to lb is correct.
+        """
+        uom = self.env["product.template"]._get_weight_uom_id_from_ir_config_parameter()
+        in_lb = uom._compute_quantity(
+            weight_in_company_uom, self.env.ref("uom.product_uom_lb")
+        )
+        total = max(in_lb + self.carrier._MAILER_WEIGHT_LB, 0.1)
+        return str(round(total, 2))
+
+    @staticmethod
+    def _parcel_sent(mock_create_shipment):
+        # create_shipment(shipper, recipient, parcel)
+        return mock_create_shipment.call_args[0][2]
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_uses_the_order_line_total_by_default(self, mock_create_shipment):
+        mock_create_shipment.return_value = load_shipment_response()
+
+        order = self._create_sale_order(qty=1)
+        self.carrier.shippo_rate_shipment(order)
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(0.25),
+        )
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_honours_the_weight_saved_on_the_order(self, mock_create_shipment):
+        mock_create_shipment.return_value = load_shipment_response()
+
+        order = self._create_sale_order(qty=1)
+        order.shipping_weight = 2.0
+
+        self.carrier.shippo_rate_shipment(order)
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(2.0),
+        )
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_honours_the_wizard_weight_from_context(self, mock_create_shipment):
+        """Highest precedence: what someone typed into the delivery wizard,
+        which core passes down as the order_weight context key."""
+        mock_create_shipment.return_value = load_shipment_response()
+
+        order = self._create_sale_order(qty=1)
+        order.shipping_weight = 2.0
+
+        self.carrier.with_context(order_weight=5.0).shippo_rate_shipment(order)
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(5.0),
+        )
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_label_honours_the_picking_shipping_weight(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        """The Put in Pack override reaches the label.
+
+        picking.shipping_weight resolves stock.quant.package.shipping_weight
+        ahead of the computed total, so setting it on the package is the
+        supported way to correct a label weight by hand.
+        """
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_create_shipment.return_value = load_shipment_response()
+        mock_buy_rate.return_value = create_mock_bought_shipment()
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = sale_order.picking_ids[0]
+        picking.action_assign()
+        picking.move_line_ids.write({"quantity": 1})
+        package = picking._put_in_pack(picking.move_line_ids)
+        package.shipping_weight = 3.0
+
+        picking._action_done()
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(3.0),
+        )

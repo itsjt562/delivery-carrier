@@ -71,7 +71,7 @@ class DeliveryCarrier(models.Model):
         sr = ShippoRequest(self)
         shipper = self._shippo_prepare_address(order.warehouse_id.partner_id)
         recipient = self._shippo_prepare_address(order.partner_shipping_id)
-        parcel = self._shippo_prepare_parcel(order._get_estimated_weight())
+        parcel = self._shippo_prepare_parcel(self._shippo_order_weight(order))
 
         shipment = sr.create_shipment(shipper, recipient, parcel)
         rate = self._shippo_select_rate(sr, shipment)
@@ -100,10 +100,7 @@ class DeliveryCarrier(models.Model):
                 picking.picking_type_id.warehouse_id.partner_id
             )
             recipient = self._shippo_prepare_address(picking.partner_id)
-            weight = sum(
-                ml.product_id.weight * ml.quantity for ml in picking.move_line_ids
-            )
-            parcel = self._shippo_prepare_parcel(weight)
+            parcel = self._shippo_prepare_parcel(self._shippo_picking_weight(picking))
 
             shipment = sr.create_shipment(shipper, recipient, parcel)
             rate = self._shippo_select_rate(sr, shipment)
@@ -143,6 +140,40 @@ class DeliveryCarrier(models.Model):
                 continue
             sr.refund_transaction(picking.shippo_shipment_id)
             picking.message_post(body=_("Shippo label voided/refund requested."))
+
+    # -- weight ---------------------------------------------------------
+    # Both of these existed as inline sums over product weights, which meant
+    # the module quoted and shipped the computed product total and nothing
+    # else. Odoo offers two places to correct a weight by hand and neither of
+    # them reached Shippo, so a parcel whose real weight differed from the
+    # catalogue sum could not be fixed anywhere in the UI.
+
+    def _shippo_order_weight(self, order):
+        """Quote-time weight, in the company weight UoM.
+
+        Same precedence core documents in `delivery/models/delivery_carrier.py`:
+        the weight typed into the delivery wizard arrives as `order_weight` in
+        the context, then the weight saved on the order, then the computed
+        order-line total.
+        """
+        return (
+            self.env.context.get("order_weight")
+            or order.shipping_weight
+            or order._get_estimated_weight()
+        )
+
+    def _shippo_picking_weight(self, picking):
+        """Label-time weight, in the company weight UoM.
+
+        `picking.shipping_weight` already resolves a Put in Pack override
+        (`stock.quant.package.shipping_weight`) ahead of the computed product
+        total, so reading it is what lets a hand-entered weight reach the label.
+        It falls back to the product sum, which keeps the previous behaviour
+        exactly when nothing has been overridden.
+        """
+        return picking.shipping_weight or sum(
+            ml.product_id.weight * ml.quantity for ml in picking.move_line_ids
+        )
 
     # -- helpers --------------------------------------------------------
     def _shippo_select_rate(self, shippo_request, shipment):
