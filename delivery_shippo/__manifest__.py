@@ -11,6 +11,7 @@
     ],
     "data": [
         "views/delivery_carrier_views.xml",
+        "views/stock_picking_views.xml",
     ],
     "external_dependencies": {"python": ["requests"]},
     "installable": True,

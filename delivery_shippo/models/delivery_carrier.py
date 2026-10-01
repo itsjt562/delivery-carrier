@@ -165,14 +165,23 @@ class DeliveryCarrier(models.Model):
     def _shippo_picking_weight(self, picking):
         """Label-time weight, in the company weight UoM.
 
-        `picking.shipping_weight` already resolves a Put in Pack override
-        (`stock.quant.package.shipping_weight`) ahead of the computed product
-        total, so reading it is what lets a hand-entered weight reach the label.
-        It falls back to the product sum, which keeps the previous behaviour
-        exactly when nothing has been overridden.
+        Three rungs, most specific first:
+
+        1. `shippo_label_weight`, typed on the delivery order after packing.
+           The only rung that works in a one-step `ship_only` warehouse with
+           the Packages feature turned off, which is the common case for
+           single-box fulfilment.
+        2. `picking.shipping_weight`, which resolves a Put in Pack override on
+           `stock.quant.package.shipping_weight` ahead of its own computed
+           total. Costs nothing to support and means enabling Packages later
+           needs no change here.
+        3. The product sum, which is the previous behaviour and keeps this
+           byte-identical when nothing has been overridden.
         """
-        return picking.shipping_weight or sum(
-            ml.product_id.weight * ml.quantity for ml in picking.move_line_ids
+        return (
+            picking.shippo_label_weight
+            or picking.shipping_weight
+            or sum(ml.product_id.weight * ml.quantity for ml in picking.move_line_ids)
         )
 
     # -- helpers --------------------------------------------------------

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <record id="shippo_view_picking_form_inherit" model="ir.ui.view">
+        <field name="name">shippo.view.picking.form.inherit</field>
+        <field name="model">stock.picking</field>
+        <field name="inherit_id" ref="stock.view_picking_form" />
+        <field name="arch" type="xml">
+            <!-- Beside the two weights it overrides, so the relationship
+                 between them is visible rather than something you have to
+                 already know. Validating is what buys the label, so this has
+                 to be set before that button is pressed. -->
+            <xpath expr="//field[@name='shipping_weight']" position="after">
+                <field
+                    name="shippo_label_weight"
+                    invisible="delivery_type != 'shippo'"
+                />
+            </xpath>
+        </field>
+    </record>
+</odoo>
