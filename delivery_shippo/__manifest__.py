@@ -1,6 +1,6 @@
 {
     "name": "Shippo Shipping OCA",
-    "version": "18.0.1.2.0",
+    "version": "18.0.1.3.0",
     "summary": "Shippo pinned service levels, declared parcel size and weight, labels, tracking, void",
     "author": "Helm Compounds",
     "website": "https://github.com/itsjt562/delivery-carrier",
