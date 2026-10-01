@@ -464,3 +464,86 @@ class TestShippoWeightIsRequired(ShippoTestBaseCase):
 
         self.assertIn(picking.name, str(caught.exception))
         mock_buy_rate.assert_not_called()
+
+
+class TestShippoTransientRateShortfall(ShippoTestBaseCase):
+    """Shippo's rate list is not stable between identical calls.
+
+    Observed live on 2026-10-01: one Sacramento to Austin call returned USPS
+    only, five identical calls minutes later all carried the full UPS set.
+    Pinning a service turns that blip into a refused label on a paid order.
+    """
+
+    SECOND_DAY = "ups_second_day_air"
+
+    def setUp(self):
+        super().setUp()
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+        # Keep the suite fast. The retry policy is what is under test, not how
+        # long it waits between attempts.
+        self.patcher = patch.object(type(self.carrier), "_SHIPPO_RATE_BACKOFF_SECONDS", 0)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    @staticmethod
+    def _without_ups(response):
+        trimmed = dict(response)
+        trimmed["rates"] = [
+            r
+            for r in response["rates"]
+            if not (r.get("servicelevel") or {}).get("token", "").startswith("ups_")
+        ]
+        return trimmed
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_a_single_bad_response_is_retried_not_surfaced(self, mock_create_shipment):
+        full = load_shipment_response()
+        mock_create_shipment.side_effect = [self._without_ups(full), full]
+
+        order = self._create_sale_order(qty=1)
+        res = self.carrier.shippo_rate_shipment(order)
+
+        self.assertTrue(res["success"])
+        self.assertEqual(mock_create_shipment.call_count, 2)
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_each_retry_creates_a_new_shipment(self, mock_create_shipment):
+        """The rate list arrives with the shipment, so re-selecting from a
+        response that already lacks the service would just fail again."""
+        full = load_shipment_response()
+        mock_create_shipment.side_effect = [
+            self._without_ups(full),
+            self._without_ups(full),
+            full,
+        ]
+
+        order = self._create_sale_order(qty=1)
+        self.carrier.shippo_rate_shipment(order)
+
+        self.assertEqual(mock_create_shipment.call_count, 3)
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_a_persistent_shortfall_still_refuses(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        """Retrying must not become substituting. If the service is genuinely
+        gone, the label is still not bought."""
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_buy_rate.return_value = create_mock_bought_shipment()
+        mock_create_shipment.return_value = self._without_ups(load_shipment_response())
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = self._ready_picking(sale_order)
+
+        with self.assertRaises(UserError) as caught:
+            picking._action_done()
+
+        self.assertIn(self.SECOND_DAY, str(caught.exception))
+        mock_buy_rate.assert_not_called()
+        self.assertEqual(
+            mock_create_shipment.call_count,
+            self.carrier._SHIPPO_RATE_ATTEMPTS,
+            "should have exhausted its attempts before giving up",
+        )

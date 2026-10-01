@@ -1,7 +1,12 @@
+import logging
+import time
+
 from odoo import _, fields, models
 from odoo.exceptions import UserError
 
 from .shippo_request import ShippoRequest
+
+_logger = logging.getLogger(__name__)
 
 # Shippo `servicelevel.token` values, read off a real rate response from the
 # Sacramento origin on 2026-10-01 rather than transcribed from docs. A
@@ -83,8 +88,7 @@ class DeliveryCarrier(models.Model):
             self._shippo_order_weight(order), self._shippo_package_type()
         )
 
-        shipment = sr.create_shipment(shipper, recipient, parcel)
-        rate = self._shippo_select_rate(sr, shipment)
+        shipment, rate = self._shippo_shipment_and_rate(sr, shipper, recipient, parcel)
         price = self._get_price_currency(float(rate["amount"]), rate.get("currency", "USD"), order)
 
         return {
@@ -115,8 +119,9 @@ class DeliveryCarrier(models.Model):
                 self._shippo_package_type(picking),
             )
 
-            shipment = sr.create_shipment(shipper, recipient, parcel)
-            rate = self._shippo_select_rate(sr, shipment)
+            shipment, rate = self._shippo_shipment_and_rate(
+                sr, shipper, recipient, parcel
+            )
             bought = sr.buy_rate(rate, self.shippo_label_file_type)
 
             price = self._get_price_currency(bought.rate, bought.currency, picking.sale_id)
@@ -208,6 +213,47 @@ class DeliveryCarrier(models.Model):
                 % {"picking": picking.name}
             )
         return weight
+
+    # Shippo's rate list is not stable between identical calls. Observed
+    # 2026-10-01 from the live account: one call for a Sacramento to Austin
+    # parcel came back with USPS only, and five consecutive calls for the exact
+    # same parcel minutes later all included the full set of eight UPS rates.
+    #
+    # The response carries "Shipment origin is out of service area for UPS
+    # Master account from CA" either way, including on the calls that returned
+    # eight UPS rates, so that message cannot be used to tell a real
+    # unavailability from a blip.
+    #
+    # Pinning a service turns that blip into a refused label on a paid order,
+    # which is correct but not something to hand a customer when one more call
+    # would have worked. Three attempts, because the observed failure rate is
+    # roughly one in eight and a second failure in a row has never been seen.
+    _SHIPPO_RATE_ATTEMPTS = 3
+    _SHIPPO_RATE_BACKOFF_SECONDS = 3
+
+    def _shippo_shipment_and_rate(self, shippo_request, shipper, recipient, parcel):
+        """A shipment plus the rate this carrier sells, retrying a shortfall.
+
+        Each retry re-creates the shipment, because the rate list is part of the
+        shipment response. Re-selecting from a response that already lacks the
+        service would just fail again.
+        """
+        last_error = None
+        for attempt in range(1, self._SHIPPO_RATE_ATTEMPTS + 1):
+            shipment = shippo_request.create_shipment(shipper, recipient, parcel)
+            try:
+                return shipment, self._shippo_select_rate(shippo_request, shipment)
+            except UserError as error:
+                last_error = error
+                if attempt < self._SHIPPO_RATE_ATTEMPTS:
+                    _logger.warning(
+                        "Shippo did not return %s on attempt %s of %s, retrying",
+                        self.shippo_service_level_token or "any rate",
+                        attempt,
+                        self._SHIPPO_RATE_ATTEMPTS,
+                    )
+                    time.sleep(self._SHIPPO_RATE_BACKOFF_SECONDS)
+        raise last_error
 
     # -- helpers --------------------------------------------------------
     def _shippo_select_rate(self, shippo_request, shipment):
