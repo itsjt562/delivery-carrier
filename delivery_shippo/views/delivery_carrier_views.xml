@@ -18,6 +18,7 @@
                                 required="delivery_type == 'shippo'"
                             />
                             <field name="shippo_label_file_type" />
+                            <field name="shippo_service_level_token" />
                         </group>
                         <group>
                             <field

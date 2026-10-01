@@ -3,6 +3,26 @@ from odoo.exceptions import UserError
 
 from .shippo_request import ShippoRequest
 
+# Shippo `servicelevel.token` values, read off a real rate response from the
+# Sacramento origin on 2026-10-01 rather than transcribed from docs. A
+# Selection rather than a free-text Char on purpose: a mistyped token would not
+# fail at configuration time, it would fail at label purchase on a paid order,
+# which is the worst possible moment to discover a typo. Adding a service means
+# extending this list, which is a one-line change and a module upgrade.
+SHIPPO_SERVICE_LEVELS = [
+    ("usps_ground_advantage", "USPS Ground Advantage"),
+    ("usps_priority", "USPS Priority Mail"),
+    ("usps_priority_express", "USPS Priority Mail Express"),
+    ("ups_ground_saver", "UPS Ground Saver"),
+    ("ups_ground", "UPS Ground"),
+    ("ups_3_day_select", "UPS 3 Day Select"),
+    ("ups_second_day_air", "UPS 2nd Day Air"),
+    ("ups_second_day_air_am", "UPS 2nd Day Air A.M."),
+    ("ups_next_day_air_saver", "UPS Next Day Air Saver"),
+    ("ups_next_day_air", "UPS Next Day Air"),
+    ("ups_next_day_air_early_am", "UPS Next Day Air Early"),
+]
+
 
 class DeliveryCarrier(models.Model):
     _inherit = "delivery.carrier"
@@ -36,6 +56,15 @@ class DeliveryCarrier(models.Model):
         help="ZPLII renders at 812x1219 dots @ 203dpi -- the standard 4x6in "
         "thermal shipping label size, confirmed against a real sandbox label.",
     )
+    shippo_service_level_token = fields.Selection(
+        SHIPPO_SERVICE_LEVELS,
+        string="Service Level",
+        help="The one carrier service this delivery method buys. Leave empty to "
+        "buy whichever rate is cheapest, which is only appropriate when nothing "
+        "has promised the customer a transit time. Set it for any method sold at "
+        "a flat price under a named tier: a storefront tier that names a service "
+        "and a label bought at the cheapest rate are two different promises.",
+    )
 
     # -- rate_shipment ------------------------------------------------------
     def shippo_rate_shipment(self, order):
@@ -45,7 +74,7 @@ class DeliveryCarrier(models.Model):
         parcel = self._shippo_prepare_parcel(order._get_estimated_weight())
 
         shipment = sr.create_shipment(shipper, recipient, parcel)
-        rate = sr.lowest_rate(shipment)
+        rate = self._shippo_select_rate(sr, shipment)
         price = self._get_price_currency(float(rate["amount"]), rate.get("currency", "USD"), order)
 
         return {
@@ -77,7 +106,7 @@ class DeliveryCarrier(models.Model):
             parcel = self._shippo_prepare_parcel(weight)
 
             shipment = sr.create_shipment(shipper, recipient, parcel)
-            rate = sr.lowest_rate(shipment)
+            rate = self._shippo_select_rate(sr, shipment)
             bought = sr.buy_rate(rate, self.shippo_label_file_type)
 
             price = self._get_price_currency(bought.rate, bought.currency, picking.sale_id)
@@ -116,6 +145,19 @@ class DeliveryCarrier(models.Model):
             picking.message_post(body=_("Shippo label voided/refund requested."))
 
     # -- helpers --------------------------------------------------------
+    def _shippo_select_rate(self, shippo_request, shipment):
+        """Which of the returned rates this carrier actually sells.
+
+        One place, used by both rate_shipment and send_shipping, so a quote and
+        the label bought against it can never disagree about the service.
+        """
+        self.ensure_one()
+        if self.shippo_service_level_token:
+            return shippo_request.rate_for_service(
+                shipment, self.shippo_service_level_token
+            )
+        return shippo_request.lowest_rate(shipment)
+
     def _shippo_prepare_address(self, addr_obj):
         if not addr_obj.phone or not addr_obj.email:
             raise UserError(

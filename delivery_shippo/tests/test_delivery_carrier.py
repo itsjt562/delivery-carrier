@@ -109,3 +109,114 @@ class TestDeliveryCarrier(ShippoTestBaseCase):
         )
         with self.assertRaises(UserError):
             self.carrier._shippo_prepare_address(no_contact_partner)
+
+
+class TestShippoServiceLevel(ShippoTestBaseCase):
+    """A carrier that names a service must buy that service or refuse.
+
+    The fixture's rate list is a real captured response carrying all eleven
+    service levels, with USPS Ground Advantage cheapest at 5.17 and UPS 2nd Day
+    Air at 10.76. That gap is what makes these assertions meaningful: every one
+    of them would also pass if the code simply sorted by price, except that the
+    expected value would be the wrong number.
+    """
+
+    SECOND_DAY = "ups_second_day_air"
+    SECOND_DAY_AMOUNT = 10.76
+    CHEAPEST_AMOUNT = 5.17
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_shipment_honours_the_pinned_service(self, mock_create_shipment):
+        mock_create_shipment.return_value = load_shipment_response()
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+
+        order = self._create_sale_order(qty=1)
+        res = self.carrier.shippo_rate_shipment(order)
+
+        self.assertTrue(res["success"])
+        self.assertAlmostEqual(res["price"], self.SECOND_DAY_AMOUNT, places=2)
+        self.assertNotAlmostEqual(res["price"], self.CHEAPEST_AMOUNT, places=2)
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_shipment_falls_back_to_cheapest_with_no_service_set(
+        self, mock_create_shipment
+    ):
+        """An empty token keeps the pre-existing behaviour, which is what the
+        one already-configured production carrier relies on."""
+        mock_create_shipment.return_value = load_shipment_response()
+        self.assertFalse(self.carrier.shippo_service_level_token)
+
+        order = self._create_sale_order(qty=1)
+        res = self.carrier.shippo_rate_shipment(order)
+
+        self.assertAlmostEqual(res["price"], self.CHEAPEST_AMOUNT, places=2)
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_send_shipping_buys_the_pinned_service(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_create_shipment.return_value = load_shipment_response()
+        mock_buy_rate.return_value = create_mock_bought_shipment(
+            tracking_code="TRACK_2DAY",
+            rate=self.SECOND_DAY_AMOUNT,
+            carrier_name="UPS",
+            carrier_service="2nd Day Air",
+        )
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = sale_order.picking_ids[0]
+        picking.action_assign()
+        picking.move_line_ids.write({"quantity": 1})
+        picking._action_done()
+
+        # The assertion that matters: the rate handed to buy_rate is the pinned
+        # service, not the cheapest one in the same response.
+        bought_rate = mock_buy_rate.call_args[0][0]
+        self.assertEqual(bought_rate["servicelevel"]["token"], self.SECOND_DAY)
+        self.assertAlmostEqual(
+            float(bought_rate["amount"]), self.SECOND_DAY_AMOUNT, places=2
+        )
+        self.assertEqual(picking.shippo_carrier_service, "2nd Day Air")
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_missing_service_raises_and_names_what_was_offered(
+        self, mock_create_shipment
+    ):
+        """A destination that cannot take the sold service must stop the label,
+        not quietly downgrade it. Simulated by removing that one rate from an
+        otherwise real response.
+        """
+        response = load_shipment_response()
+        response["rates"] = [
+            r
+            for r in response["rates"]
+            if (r.get("servicelevel") or {}).get("token") != self.SECOND_DAY
+        ]
+        self.assertTrue(response["rates"], "fixture should still offer other services")
+        mock_create_shipment.return_value = response
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+
+        order = self._create_sale_order(qty=1)
+        with self.assertRaises(UserError) as caught:
+            self.carrier.shippo_rate_shipment(order)
+
+        message = str(caught.exception)
+        self.assertIn(self.SECOND_DAY, message)
+        # The offered list is the actionable part -- without it the error says
+        # only that something is wrong.
+        self.assertIn("usps_ground_advantage", message)
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_no_rates_at_all_raises(self, mock_create_shipment):
+        response = load_shipment_response()
+        response["rates"] = []
+        mock_create_shipment.return_value = response
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+
+        order = self._create_sale_order(qty=1)
+        with self.assertRaises(UserError):
+            self.carrier.shippo_rate_shipment(order)
