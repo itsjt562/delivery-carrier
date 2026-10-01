@@ -11,6 +11,11 @@
                  to be set before that button is pressed. -->
             <xpath expr="//field[@name='shipping_weight']" position="after">
                 <field
+                    name="shippo_package_type_id"
+                    invisible="delivery_type != 'shippo'"
+                    options="{'no_create_edit': True}"
+                />
+                <field
                     name="shippo_label_weight"
                     invisible="delivery_type != 'shippo'"
                 />

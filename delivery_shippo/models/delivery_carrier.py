@@ -56,6 +56,14 @@ class DeliveryCarrier(models.Model):
         help="ZPLII renders at 812x1219 dots @ 203dpi -- the standard 4x6in "
         "thermal shipping label size, confirmed against a real sandbox label.",
     )
+    shippo_default_package_type_id = fields.Many2one(
+        "stock.package.type",
+        string="Default Packaging",
+        domain="[('package_carrier_type', 'in', ('none', 'shippo'))]",
+        help="Dimensions used when a delivery order does not name its own "
+        "packaging. Set this to whatever most orders ship in, so the common "
+        "case needs no input at all and only the unusual parcel needs a choice.",
+    )
     shippo_service_level_token = fields.Selection(
         SHIPPO_SERVICE_LEVELS,
         string="Service Level",
@@ -71,7 +79,9 @@ class DeliveryCarrier(models.Model):
         sr = ShippoRequest(self)
         shipper = self._shippo_prepare_address(order.warehouse_id.partner_id)
         recipient = self._shippo_prepare_address(order.partner_shipping_id)
-        parcel = self._shippo_prepare_parcel(self._shippo_order_weight(order))
+        parcel = self._shippo_prepare_parcel(
+            self._shippo_order_weight(order), self._shippo_package_type()
+        )
 
         shipment = sr.create_shipment(shipper, recipient, parcel)
         rate = self._shippo_select_rate(sr, shipment)
@@ -100,7 +110,10 @@ class DeliveryCarrier(models.Model):
                 picking.picking_type_id.warehouse_id.partner_id
             )
             recipient = self._shippo_prepare_address(picking.partner_id)
-            parcel = self._shippo_prepare_parcel(self._shippo_picking_weight(picking))
+            parcel = self._shippo_prepare_parcel(
+                self._shippo_picking_weight(picking),
+                self._shippo_package_type(picking),
+            )
 
             shipment = sr.create_shipment(shipper, recipient, parcel)
             rate = self._shippo_select_rate(sr, shipment)
@@ -165,24 +178,36 @@ class DeliveryCarrier(models.Model):
     def _shippo_picking_weight(self, picking):
         """Label-time weight, in the company weight UoM.
 
-        Three rungs, most specific first:
+        Two rungs, most specific first, and then a refusal:
 
-        1. `shippo_label_weight`, typed on the delivery order after packing.
-           The only rung that works in a one-step `ship_only` warehouse with
-           the Packages feature turned off, which is the common case for
-           single-box fulfilment.
+        1. `shippo_label_weight`, read off a scale after packing and typed on
+           the delivery order. The only rung that works in a one-step
+           `ship_only` warehouse with the Packages feature off, which is the
+           common case for single-box fulfilment.
         2. `picking.shipping_weight`, which resolves a Put in Pack override on
-           `stock.quant.package.shipping_weight` ahead of its own computed
-           total. Costs nothing to support and means enabling Packages later
-           needs no change here.
-        3. The product sum, which is the previous behaviour and keeps this
-           byte-identical when nothing has been overridden.
+           `stock.quant.package.shipping_weight`. Costs nothing to support and
+           means enabling Packages later needs no change here.
+
+        WHY THERE IS NO PRODUCT-WEIGHT FALLBACK
+
+        There used to be, and it was the quiet failure. A catalogue whose
+        weights are unset sums to zero, the parcel lands on a floor weight, and
+        the carrier bills the difference weeks later against a label that
+        already shipped. A missing weight is a question for a human, not a
+        number to invent, so this raises instead.
         """
-        return (
-            picking.shippo_label_weight
-            or picking.shipping_weight
-            or sum(ml.product_id.weight * ml.quantity for ml in picking.move_line_ids)
-        )
+        weight = picking.shippo_label_weight or picking.shipping_weight
+        if not weight:
+            raise UserError(
+                _(
+                    "No shipping weight is set on %(picking)s, so no label was "
+                    "bought.\n\n"
+                    "Weigh the packed parcel and enter it as Label Weight on this "
+                    "delivery order, then validate again."
+                )
+                % {"picking": picking.name}
+            )
+        return weight
 
     # -- helpers --------------------------------------------------------
     def _shippo_select_rate(self, shippo_request, shipment):
@@ -223,31 +248,68 @@ class DeliveryCarrier(models.Model):
             address["state"] = addr_obj.state_id.code
         return address
 
-    # Helm ships everything in one packaging format -- confirmed with Joseph
-    # 2026-08-12: 8x12x1in bubble mailer, ~8oz packaging weight (mailer +
-    # insert), flat regardless of order contents. No stock.package.type
-    # variation needed unless that changes.
-    _MAILER_LENGTH_IN = "12"
-    _MAILER_WIDTH_IN = "8"
-    _MAILER_HEIGHT_IN = "1"
-    _MAILER_WEIGHT_LB = 0.5  # 8 oz
+    # -- parcel ---------------------------------------------------------
+    # The dimensions used to be three hardcoded constants describing one
+    # bubble mailer. That is fine right up until something ships in a box, at
+    # which point the carrier is quoted and billed against a parcel that does
+    # not exist. Dimensional weight means wrong dimensions cost real money
+    # even when the scale weight is right.
 
-    def _shippo_prepare_parcel(self, weight) -> dict:
-        # weight arrives in Odoo's configured weight UoM (kg by default,
-        # lb if product.weight_in_lbs is set) -- convert explicitly rather
-        # than assume, same pattern as delivery_easypost_oca's
-        # _easypost_oca_convert_weight.
-        weight_uom_id = self.env[
-            "product.template"
-        ]._get_weight_uom_id_from_ir_config_parameter()
-        weight_lb = weight_uom_id._compute_quantity(weight, self.env.ref("uom.product_uom_lb"))
-        total_lb = max(weight_lb + self._MAILER_WEIGHT_LB, 0.1)
+    def _shippo_package_type(self, picking=None):
+        """Which packaging to declare, most specific first.
+
+        Refuses rather than guessing. A default parcel size invented here
+        would be wrong silently and chargeable, which is the failure mode this
+        replaced.
+        """
+        self.ensure_one()
+        package_type = (picking and picking.shippo_package_type_id) or (
+            self.shippo_default_package_type_id
+        )
+        if not package_type:
+            raise UserError(
+                _(
+                    "No packaging is set, so there are no dimensions to quote.\n\n"
+                    "Set Default Packaging on the %(carrier)s delivery method, or "
+                    "pick a packaging on this delivery order."
+                )
+                % {"carrier": self.name}
+            )
+        return package_type
+
+    def _shippo_prepare_parcel(self, weight, package_type) -> dict:
+        """Build the parcel Shippo is quoted and billed on.
+
+        `weight` is the TOTAL declared weight in the database's weight UoM, not
+        a contents weight to which packaging is then added. Callers decide what
+        total means: the label path uses the number somebody read off a scale
+        after packing, the quote path uses an estimate. Adding packaging weight
+        here would double-count the first and is the caller's job in the second.
+
+        Both unit conversions are explicit rather than assumed, because the
+        database can be configured in kg or lb and in mm, inches or feet, while
+        Shippo is always quoted in lb and inches.
+        """
+        product_tmpl = self.env["product.template"]
+        weight_uom = product_tmpl._get_weight_uom_id_from_ir_config_parameter()
+        length_uom = product_tmpl._get_length_uom_id_from_ir_config_parameter()
+        inch = self.env.ref("uom.product_uom_inch")
+
+        # Shippo rejects a zero-weight parcel outright.
+        weight_lb = max(
+            weight_uom._compute_quantity(weight, self.env.ref("uom.product_uom_lb")),
+            0.1,
+        )
+
+        def to_inches(value):
+            return str(round(length_uom._compute_quantity(value, inch), 2))
+
         return {
-            "length": self._MAILER_LENGTH_IN,
-            "width": self._MAILER_WIDTH_IN,
-            "height": self._MAILER_HEIGHT_IN,
+            "length": to_inches(package_type.packaging_length),
+            "width": to_inches(package_type.width),
+            "height": to_inches(package_type.height),
             "distance_unit": "in",
-            "weight": str(round(total_lb, 2)),
+            "weight": str(round(weight_lb, 2)),
             "mass_unit": "lb",
         }
 

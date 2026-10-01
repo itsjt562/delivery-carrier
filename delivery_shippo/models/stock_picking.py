@@ -32,6 +32,16 @@ class StockPicking(models.Model):
     # So: one stored, writable float on the record the picker is already
     # looking at. _shippo_picking_weight reads it first and still honours the
     # package path underneath, so enabling Packages later changes nothing here.
+    shippo_package_type_id = fields.Many2one(
+        "stock.package.type",
+        string="Packaging",
+        copy=False,
+        domain="[('package_carrier_type', 'in', ('none', 'shippo'))]",
+        help="The box or mailer this parcel actually ships in. Its dimensions "
+        "are what the carrier quotes and bills against, so a wrong size costs "
+        "real money through dimensional weight even when the scale weight is "
+        "right. Leave empty to use the delivery method's default packaging.",
+    )
     shippo_label_weight = fields.Float(
         "Label Weight",
         copy=False,
