@@ -108,6 +108,52 @@ class ShippoRequest:
             raise UserError(_("No rate found for this shipping."))
         return min(rates, key=lambda r: float(r["amount"]))
 
+    def rate_for_service(self, shipment: dict, token: str) -> dict:
+        """Pick the rate for one named service level, or refuse.
+
+        WHY THIS EXISTS RATHER THAN JUST SORTING DIFFERENTLY
+
+        A storefront that sells a named tier at a flat price has already made a
+        promise about transit time. Buying the cheapest rate instead breaks that
+        promise silently, and the first person to find out is the customer who
+        paid for 2-day. Measured against the real rate list from a Sacramento
+        origin on 2026-10-01, `lowest_rate` on a lower-48 shipment returns
+        `ups_ground_saver` at a 4-day estimate, so a $20 2-day order would ship
+        as a 4-day parcel with nothing anywhere recording that it had happened.
+
+        WHY IT RAISES INSTEAD OF FALLING BACK
+
+        A substitution is the bug. If the configured service is genuinely not
+        available for a destination, the honest outcomes are a different tier or
+        a human decision, not a quiet downgrade. `_send_confirmation_email`
+        turns this UserError into a scheduled warning activity on the picking,
+        so it surfaces as work to do rather than a lost order.
+        """
+        rates = shipment.get("rates", [])
+        if not rates:
+            raise UserError(_("No rate found for this shipping."))
+        for rate in rates:
+            if (rate.get("servicelevel") or {}).get("token") == token:
+                return rate
+        offered = sorted(
+            {
+                (r.get("servicelevel") or {}).get("token")
+                for r in rates
+                if (r.get("servicelevel") or {}).get("token")
+            }
+        )
+        raise UserError(
+            _(
+                "Shippo did not offer the service this delivery method sells, so "
+                "no label was bought.\n\n"
+                "Required service level: %(token)s\n"
+                "Offered for this shipment: %(offered)s\n\n"
+                "Either this destination cannot take that service, or the carrier "
+                "account no longer has it enabled."
+            )
+            % {"token": token, "offered": ", ".join(offered) or _("none")}
+        )
+
     def buy_rate(self, rate: dict, label_file_type: str = "PDF") -> "ShippoShipment":
         """POST /transactions -- purchases the label for a given rate object."""
         body = {

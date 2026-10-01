@@ -60,6 +60,26 @@ class ShippoTestBaseCase(TransactionCase):
             }
         )
 
+        # Dimensions are now required rather than hardcoded, so every test
+        # needs real packaging. Deliberately not square, so a test that mixed
+        # up length/width/height would fail rather than coincidentally pass.
+        cls.package_type = cls.env["stock.package.type"].create(
+            {
+                "name": "Test Bubble Mailer",
+                "packaging_length": 12.0,
+                "width": 8.0,
+                "height": 1.0,
+            }
+        )
+        cls.big_box = cls.env["stock.package.type"].create(
+            {
+                "name": "Test Big Box",
+                "packaging_length": 20.0,
+                "width": 16.0,
+                "height": 10.0,
+            }
+        )
+
         cls.carrier = cls.env["delivery.carrier"].create(
             {
                 "name": "SHIPPO",
@@ -67,8 +87,19 @@ class ShippoTestBaseCase(TransactionCase):
                 "shippo_test_api_key": SHIPPO_TEST_KEY,
                 "shippo_label_file_type": "PDF",
                 "product_id": cls.delivery_product.id,
+                "shippo_default_package_type_id": cls.package_type.id,
             }
         )
+
+    def _ready_picking(self, sale_order, weight=1.0):
+        """A picking packed and weighed, which is now the precondition for a
+        label rather than something the module invents."""
+        picking = sale_order.picking_ids[0]
+        picking.action_assign()
+        picking.move_line_ids.write({"quantity": 1})
+        if weight is not None:
+            picking.shippo_label_weight = weight
+        return picking
 
     def _create_sale_order(self, qty=1):
         order_form = Form(self.env["sale.order"])

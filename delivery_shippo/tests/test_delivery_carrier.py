@@ -48,9 +48,7 @@ class TestDeliveryCarrier(ShippoTestBaseCase):
         # via the same mock -- fine, that's the point of mocking the class
         # method rather than the HTTP layer.
         sale_order = self._create_sale_order(qty=1)
-        picking = sale_order.picking_ids[0]
-        picking.action_assign()
-        picking.move_line_ids.write({"quantity": 1})
+        picking = self._ready_picking(sale_order)
 
         picking._action_done()
 
@@ -109,3 +107,360 @@ class TestDeliveryCarrier(ShippoTestBaseCase):
         )
         with self.assertRaises(UserError):
             self.carrier._shippo_prepare_address(no_contact_partner)
+
+
+class TestShippoServiceLevel(ShippoTestBaseCase):
+    """A carrier that names a service must buy that service or refuse.
+
+    The fixture's rate list is a real captured response carrying all eleven
+    service levels, with USPS Ground Advantage cheapest at 5.17 and UPS 2nd Day
+    Air at 10.76. That gap is what makes these assertions meaningful: every one
+    of them would also pass if the code simply sorted by price, except that the
+    expected value would be the wrong number.
+    """
+
+    SECOND_DAY = "ups_second_day_air"
+    SECOND_DAY_AMOUNT = 10.76
+    CHEAPEST_AMOUNT = 5.17
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_shipment_honours_the_pinned_service(self, mock_create_shipment):
+        mock_create_shipment.return_value = load_shipment_response()
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+
+        order = self._create_sale_order(qty=1)
+        res = self.carrier.shippo_rate_shipment(order)
+
+        self.assertTrue(res["success"])
+        self.assertAlmostEqual(res["price"], self.SECOND_DAY_AMOUNT, places=2)
+        self.assertNotAlmostEqual(res["price"], self.CHEAPEST_AMOUNT, places=2)
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_shipment_falls_back_to_cheapest_with_no_service_set(
+        self, mock_create_shipment
+    ):
+        """An empty token keeps the pre-existing behaviour, which is what the
+        one already-configured production carrier relies on."""
+        mock_create_shipment.return_value = load_shipment_response()
+        self.assertFalse(self.carrier.shippo_service_level_token)
+
+        order = self._create_sale_order(qty=1)
+        res = self.carrier.shippo_rate_shipment(order)
+
+        self.assertAlmostEqual(res["price"], self.CHEAPEST_AMOUNT, places=2)
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_send_shipping_buys_the_pinned_service(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_create_shipment.return_value = load_shipment_response()
+        mock_buy_rate.return_value = create_mock_bought_shipment(
+            tracking_code="TRACK_2DAY",
+            rate=self.SECOND_DAY_AMOUNT,
+            carrier_name="UPS",
+            carrier_service="2nd Day Air",
+        )
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = self._ready_picking(sale_order)
+        picking._action_done()
+
+        # The assertion that matters: the rate handed to buy_rate is the pinned
+        # service, not the cheapest one in the same response.
+        bought_rate = mock_buy_rate.call_args[0][0]
+        self.assertEqual(bought_rate["servicelevel"]["token"], self.SECOND_DAY)
+        self.assertAlmostEqual(
+            float(bought_rate["amount"]), self.SECOND_DAY_AMOUNT, places=2
+        )
+        self.assertEqual(picking.shippo_carrier_service, "2nd Day Air")
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_missing_service_raises_and_names_what_was_offered(
+        self, mock_create_shipment
+    ):
+        """A destination that cannot take the sold service must stop the label,
+        not quietly downgrade it. Simulated by removing that one rate from an
+        otherwise real response.
+        """
+        response = load_shipment_response()
+        response["rates"] = [
+            r
+            for r in response["rates"]
+            if (r.get("servicelevel") or {}).get("token") != self.SECOND_DAY
+        ]
+        self.assertTrue(response["rates"], "fixture should still offer other services")
+        mock_create_shipment.return_value = response
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+
+        order = self._create_sale_order(qty=1)
+        with self.assertRaises(UserError) as caught:
+            self.carrier.shippo_rate_shipment(order)
+
+        message = str(caught.exception)
+        self.assertIn(self.SECOND_DAY, message)
+        # The offered list is the actionable part -- without it the error says
+        # only that something is wrong.
+        self.assertIn("usps_ground_advantage", message)
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_no_rates_at_all_raises(self, mock_create_shipment):
+        response = load_shipment_response()
+        response["rates"] = []
+        mock_create_shipment.return_value = response
+        self.carrier.shippo_service_level_token = self.SECOND_DAY
+
+        order = self._create_sale_order(qty=1)
+        with self.assertRaises(UserError):
+            self.carrier.shippo_rate_shipment(order)
+
+
+class TestShippoWeightOverrides(ShippoTestBaseCase):
+    """A weight typed by a human has to reach Shippo.
+
+    Both API paths used to sum product weights inline, so neither of Odoo's two
+    hand-override points reached the parcel. The test product weighs 0.25 in
+    the company weight UoM, so every expectation here is a different number
+    from the catalogue default, which is the only way to tell a honoured
+    override from an ignored one.
+    """
+
+    def _expected_parcel_weight(self, weight_in_company_uom):
+        """What _shippo_prepare_parcel should produce for a given input weight.
+
+        Mirrors the conversion deliberately. What is under test is which weight
+        gets selected, not whether the unit conversion is correct. The weight
+        passed in is the total, so nothing is added for packaging.
+        """
+        uom = self.env["product.template"]._get_weight_uom_id_from_ir_config_parameter()
+        in_lb = uom._compute_quantity(
+            weight_in_company_uom, self.env.ref("uom.product_uom_lb")
+        )
+        return str(round(max(in_lb, 0.1), 2))
+
+    @staticmethod
+    def _parcel_sent(mock_create_shipment):
+        # create_shipment(shipper, recipient, parcel)
+        return mock_create_shipment.call_args[0][2]
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_uses_the_order_line_total_by_default(self, mock_create_shipment):
+        mock_create_shipment.return_value = load_shipment_response()
+
+        order = self._create_sale_order(qty=1)
+        self.carrier.shippo_rate_shipment(order)
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(0.25),
+        )
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_honours_the_weight_saved_on_the_order(self, mock_create_shipment):
+        mock_create_shipment.return_value = load_shipment_response()
+
+        order = self._create_sale_order(qty=1)
+        order.shipping_weight = 2.0
+
+        self.carrier.shippo_rate_shipment(order)
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(2.0),
+        )
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_rate_honours_the_wizard_weight_from_context(self, mock_create_shipment):
+        """Highest precedence: what someone typed into the delivery wizard,
+        which core passes down as the order_weight context key."""
+        mock_create_shipment.return_value = load_shipment_response()
+
+        order = self._create_sale_order(qty=1)
+        order.shipping_weight = 2.0
+
+        self.carrier.with_context(order_weight=5.0).shippo_rate_shipment(order)
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(5.0),
+        )
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_label_honours_the_picking_shipping_weight(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        """The Put in Pack override reaches the label.
+
+        picking.shipping_weight resolves stock.quant.package.shipping_weight
+        ahead of the computed total, so setting it on the package is the
+        supported way to correct a label weight by hand.
+        """
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_create_shipment.return_value = load_shipment_response()
+        mock_buy_rate.return_value = create_mock_bought_shipment()
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = self._ready_picking(sale_order, weight=None)
+        package = picking._put_in_pack(picking.move_line_ids)
+        package.shipping_weight = 3.0
+
+        picking._action_done()
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(3.0),
+        )
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_label_honours_the_weight_typed_on_the_delivery_order(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        """The rung that matters in a one-step warehouse with Packages off,
+        which is the configuration this is actually deployed into."""
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_create_shipment.return_value = load_shipment_response()
+        mock_buy_rate.return_value = create_mock_bought_shipment()
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = self._ready_picking(sale_order, weight=4.0)
+
+        picking._action_done()
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(4.0),
+        )
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_typed_weight_beats_the_package_weight(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        """Precedence, not just presence. Someone who weighed the finished box
+        and typed it in outranks whatever the packing step recorded."""
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_create_shipment.return_value = load_shipment_response()
+        mock_buy_rate.return_value = create_mock_bought_shipment()
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = self._ready_picking(sale_order, weight=4.0)
+        package = picking._put_in_pack(picking.move_line_ids)
+        package.shipping_weight = 3.0
+
+        picking._action_done()
+
+        self.assertEqual(
+            self._parcel_sent(mock_create_shipment)["weight"],
+            self._expected_parcel_weight(4.0),
+        )
+
+
+class TestShippoParcelDimensions(ShippoTestBaseCase):
+    """Dimensions are quoted and billed on, so they have to be real.
+
+    They used to be three constants describing one bubble mailer, which is
+    correct until something ships in a box and then silently wrong in a way
+    dimensional weight turns into money.
+    """
+
+    def _expected_inches(self, value):
+        product_tmpl = self.env["product.template"]
+        length_uom = product_tmpl._get_length_uom_id_from_ir_config_parameter()
+        return str(
+            round(
+                length_uom._compute_quantity(
+                    value, self.env.ref("uom.product_uom_inch")
+                ),
+                2,
+            )
+        )
+
+    @staticmethod
+    def _parcel_sent(mock_create_shipment):
+        return mock_create_shipment.call_args[0][2]
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_quote_uses_the_carrier_default_packaging(self, mock_create_shipment):
+        mock_create_shipment.return_value = load_shipment_response()
+
+        order = self._create_sale_order(qty=1)
+        self.carrier.shippo_rate_shipment(order)
+
+        parcel = self._parcel_sent(mock_create_shipment)
+        self.assertEqual(parcel["length"], self._expected_inches(12.0))
+        self.assertEqual(parcel["width"], self._expected_inches(8.0))
+        self.assertEqual(parcel["height"], self._expected_inches(1.0))
+        self.assertEqual(parcel["distance_unit"], "in")
+        self.assertEqual(parcel["mass_unit"], "lb")
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_picking_packaging_overrides_the_carrier_default(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        """The whole point of the per-picking field: one order goes in a box
+        while the default stays the mailer."""
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_create_shipment.return_value = load_shipment_response()
+        mock_buy_rate.return_value = create_mock_bought_shipment()
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = self._ready_picking(sale_order)
+        picking.shippo_package_type_id = self.big_box
+
+        picking._action_done()
+
+        parcel = self._parcel_sent(mock_create_shipment)
+        self.assertEqual(parcel["length"], self._expected_inches(20.0))
+        self.assertEqual(parcel["width"], self._expected_inches(16.0))
+        self.assertEqual(parcel["height"], self._expected_inches(10.0))
+
+    @patch.object(ShippoRequest, "create_shipment")
+    def test_no_packaging_anywhere_raises(self, mock_create_shipment):
+        mock_create_shipment.return_value = load_shipment_response()
+        self.carrier.shippo_default_package_type_id = False
+
+        order = self._create_sale_order(qty=1)
+        with self.assertRaises(UserError) as caught:
+            self.carrier.shippo_rate_shipment(order)
+        self.assertIn("packaging", str(caught.exception).lower())
+
+
+class TestShippoWeightIsRequired(ShippoTestBaseCase):
+    """A missing weight is a question for a human, not a number to invent."""
+
+    @patch("requests.get")
+    @patch.object(ShippoRequest, "create_shipment")
+    @patch.object(ShippoRequest, "buy_rate")
+    def test_label_without_a_weight_raises_and_buys_nothing(
+        self, mock_buy_rate, mock_create_shipment, mock_requests_get
+    ):
+        """The regression that matters most. The old code summed product
+        weights, got zero from an unweighed catalogue, and shipped on a floor
+        weight the carrier later billed the difference on.
+        """
+        mock_requests_get.return_value = mock_requests_get_label()
+        mock_create_shipment.return_value = load_shipment_response()
+        mock_buy_rate.return_value = create_mock_bought_shipment()
+
+        # Products in this suite do carry a weight, so zero them to reproduce
+        # the real catalogue, where nothing is weighed.
+        self.product.weight = 0.0
+
+        sale_order = self._create_sale_order(qty=1)
+        picking = self._ready_picking(sale_order, weight=None)
+
+        with self.assertRaises(UserError) as caught:
+            picking._action_done()
+
+        self.assertIn(picking.name, str(caught.exception))
+        mock_buy_rate.assert_not_called()
