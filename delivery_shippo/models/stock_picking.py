@@ -45,8 +45,8 @@ class StockPicking(models.Model):
     shippo_label_weight = fields.Float(
         "Label Weight",
         copy=False,
-        help="Weight to declare on the shipping label, in this database's "
-        "weight unit. Set it after packing and before validating, since "
-        "validating is what buys the label. Leave at zero to fall back to the "
-        "packed weight, or to the sum of the product weights.",
+        help="Weight of the packed parcel, in this database's weight unit. "
+        "Weigh the box and type what the scale says. Validating is what buys "
+        "the label, so this has to be right before then. Left at zero, no "
+        "label is bought and the transfer refuses with a message saying why.",
     )
